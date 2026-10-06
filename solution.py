@@ -5,10 +5,11 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 import matplotlib.pyplot as plt
 from matplotlib import cm
-
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
-EXTENDED_EVALUATION = False
+EXTENDED_EVALUATION = True
 EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluation
 
 # Cost function constants
@@ -29,6 +30,8 @@ class Model(object):
         We already provide a random number generator for reproducibility.
         """
         self.rng = np.random.default_rng(seed=0)
+        z = brentq(lambda z: z * (norm.cdf(z) + 50 * (1 - norm.cdf(z))) - 49 * norm.pdf(z), 0, 5)
+        self.residential_shift = z
 
         # TODO: Add custom initialization for your model here if necessary
 
@@ -40,8 +43,26 @@ class Model(object):
         :param train_pollution_targets: Training pollution concentrations as a 1d NumPy float array of shape (NUM_SAMPLES,)
         :param train_residential_flags: Binary variable denoting whether the 2D training point is in the residential area (1) or not (0)
         """
-
+        #because of the size of train_x, we proceed to undersampling with n_samples data
+        #we don't try to keep more data within the candidate area because we have weighted dataset (more than 7000 of data points are within candidate area => sea test_code.py)
         # TODO: Fit your model here
+        n_samples = 2000
+        subset_idx = self.rng.choice(train_coordinates.shape[0],size = n_samples, replace=False)
+        X = train_coordinates[subset_idx]
+        Y = train_pollution_targets[subset_idx]
+        #we define the kernel by combining simple building blocks
+        kernel = (
+        ConstantKernel(1.0, (1e-3, 1e3))                  # signal variance to get a constant kernel that has the good order of magnitude. 1 is the starting point and (1e-3, 1e3) is the bound the optimizer is allowed to search within
+        * RBF(length_scale=0.2, length_scale_bounds=(1e-2, 1e2))  # spatial correlation => correlation is maximal at distance 0 and decays smoothly to 0 as points separate, at a rate controlled by length_scale
+        + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e2))  # measurement noise => we selected white noise to have zero covariance between the noises from different points. (because we assume that noises are independent between data points)
+    )
+        #we fit to maximize the marginal likelihood 
+        self.gp = GaussianProcessRegressor(
+        kernel=kernel,
+        n_restarts_optimizer=15,   # log-ML is non-convex so we could get stuck in local minima 
+        normalize_y=True,        # handles the mean function m(x) for us
+    )
+        self.gp.fit(X, Y)
         pass
 
     # Don't change the name or the signature of this function
@@ -58,10 +79,12 @@ class Model(object):
         # TODO: Use your GP to estimate the posterior mean and stddev for each city_area here
         gp_mean = np.zeros(test_coordinates.shape[0], dtype=float)
         gp_std = np.zeros(test_coordinates.shape[0], dtype=float)
-
+        gp_mean,gp_std = self.gp.predict(test_coordinates,return_std=True)
+        gp_std = gp_std.ravel()
         # TODO: Use the GP posterior to form your predictions here
-        predictions = gp_mean
-
+        predictions = gp_mean.copy()
+        res = np.asarray(test_residential_flags, dtype=bool)
+        predictions[res] += self.residential_shift * gp_std[res]
         return predictions, gp_mean, gp_std
 
 # You don't have to change this function
@@ -181,6 +204,10 @@ def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[
     test_residential_flags = np.zeros((test_x.shape[0],), dtype=bool)
 
     #TODO: Extract the city_area information from the training and test features
+    train_coordinates = train_x[:,:2]
+    train_residential_flags = train_x[:,2] > 0
+    test_coordinates = test_x[:,:2]
+    test_residential_flags = test_x[:,2] > 0
 
     assert train_coordinates.shape[0] == train_residential_flags.shape[0] and test_coordinates.shape[0] == test_residential_flags.shape[0]
     assert train_coordinates.shape[1] == 2 and test_coordinates.shape[1] == 2
