@@ -1,12 +1,15 @@
 import os
 import typing
-from sklearn.gaussian_process.kernels import *
+from typing import Tuple
 import numpy as np
-from sklearn.gaussian_process import GaussianProcessRegressor
-import matplotlib.pyplot as plt
-from matplotlib import cm
+from scipy.linalg import cho_factor, cho_solve, eigh
 from scipy.optimize import brentq
 from scipy.stats import norm
+from sklearn.cluster import KMeans
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+import matplotlib.pyplot as plt
+from matplotlib import cm
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
 EXTENDED_EVALUATION = True
@@ -15,6 +18,82 @@ EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluatio
 # Cost function constants
 COST_W_UNDERPREDICT = 50.0
 COST_W_NORMAL = 1.0
+
+class NystroemGP:
+    """GP regression with a low-rank Nyström kernel approximation."""
+
+    def __init__(self, length_scale: float, sigma_f: float, sigma_n: float):
+        """
+        :param length_scale: RBF length-scale l (spatial correlation range)
+        :param sigma_f: signal standard deviation (amplitude of the field)
+        :param sigma_n: measurement-noise standard deviation
+        """
+        self.length_scale = length_scale
+        self.sigma_f = sigma_f
+        self.sigma_n = sigma_n
+        self.landmarks = None
+        self.W_half_inv = None
+        self.chol = None
+        self.w_mean = None
+        self.y_mean = 0.0
+
+    def _kernel_matrix(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
+        """Full RBF kernel matrix k(X1, X2), including the signal amplitude."""
+        # Squared Euclidean distances via ||a||^2 - 2 a.b + ||b||^2 (fast, no broadcast)
+        X1_sq = np.sum(X1 ** 2, axis=1)[:, None]
+        X2_sq = np.sum(X2 ** 2, axis=1)[None, :]
+        d2 = X1_sq - 2.0 * (X1 @ X2.T) + X2_sq
+        d2 = np.maximum(d2, 0.0)  # guard against tiny negative values
+        return (self.sigma_f ** 2) * np.exp(-d2 / (2.0 * self.length_scale ** 2))
+
+    def fit(self, X: np.ndarray, y: np.ndarray, landmarks: np.ndarray) -> None:
+        """Fit on ALL n training points (no subsampling needed any more)."""
+        self.landmarks = np.asarray(landmarks, dtype=float)
+        self.y_mean = float(np.mean(y))
+        y_c = y - self.y_mean
+
+        # --- Nyström ingredients ---
+        W = self._kernel_matrix(self.landmarks, self.landmarks)   # (m, m)
+        W = 0.5 * (W + W.T)                                      # enforce symmetry
+        # W^{-1/2} via eigendecomposition, with clipping for numerical safety
+        evals, evecs = eigh(W)
+        evals = np.clip(evals, 1e-10 * max(evals[-1], 1.0), None)
+        self.W_half_inv = (evecs / np.sqrt(evals)) @ evecs.T      # (m, m)
+
+        C = self._kernel_matrix(X, self.landmarks)               # (n, m)
+        Phi = C @ self.W_half_inv                                 # features (n, m)
+
+        # --- Bayesian linear regression in feature space ---
+        # Posterior of w ~ N(0, I) under y = Phi w + eps, eps ~ N(0, sigma_n^2 I):
+        #   precision: B = Phi^T Phi + sigma_n^2 I   (m x m -> cheap Cholesky!)
+        #   mean:      w = B^{-1} Phi^T (y - y_mean)
+        m = Phi.shape[1]
+        B = Phi.T @ Phi + (self.sigma_n ** 2) * np.eye(m)
+        c, low = cho_factor(B)
+        self.chol = (c, low)
+        self.w_mean = cho_solve(self.chol, Phi.T @ y_c)
+
+    def predict(self, Xs: np.ndarray, chunk_size: int = 8192) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Posterior mean and std of the LATENT (noise-free) function at Xs.
+        Chunked to bound memory for large evaluation grids.
+        """
+        n = Xs.shape[0]
+        means = np.empty(n, dtype=float)
+        stds = np.empty(n, dtype=float)
+        for start in range(0, n, chunk_size):
+            Xb = Xs[start:start + chunk_size]
+            Cb = self._kernel_matrix(Xb, self.landmarks)          # (b, m)
+            Phib = Cb @ self.W_half_inv                          # (b, m)
+
+            # Posterior mean: E[f*] = phi(x*)^T w_mean + y_mean
+            means[start:start + Xb.shape[0]] = Phib @ self.w_mean + self.y_mean
+
+            # Posterior variance: Var[f*] = phi(x*)^T B^{-1} phi(x*), row-wise
+            sol = cho_solve(self.chol, Phib.T)                   # B^{-1} Phi_b^T (m, b)
+            var = np.einsum('ij,ji->i', Phib, sol)            # diagonal only
+            stds[start:start + Xb.shape[0]] = np.sqrt(np.maximum(var, 0.0))
+        return means, stds
 
 
 class Model(object):
@@ -29,14 +108,25 @@ class Model(object):
         Initialize your model here.
         We already provide a random number generator for reproducibility.
         """
-        #We solve the optimization problem to find the right multiplier z to get the proper scaling of the original GP best guess.
         self.rng = np.random.default_rng(seed=0)
-        z = brentq(lambda z: z * (norm.cdf(z) + 50 * (1 - norm.cdf(z))) - 49 * norm.pdf(z), 0, 5)
-        self.residential_shift = z
 
-        # TODO: Add custom initialization for your model here if necessary
+        # -------- Configuration (tune these with spatial CV, not with the public score!) --------
+        self.N_HYPER_SAMPLE = 3000          # subsample size for ML-II hyperparameter learning
+        self.N_LANDMARKS = 3000            # number of Nyström landmarks m
+        self.RES_LANDMARK_FRACTION = 0.25   # fraction of landmarks reserved for residential areas
 
-    # Don't change the name or the signature of this function
+        # -------- Challenge 3: optimal overprediction shift under the asymmetric cost --------
+        # The Bayes-optimal report under weighted squared loss with posterior N(mu, sigma^2)
+        # is a = mu + z* sigma, where z* solves
+        #     z [Phi(z) + w (1 - Phi(z))] = (w - 1) phi(z),   w = COST_W_UNDERPREDICT
+        # (derived by setting d/da E[loss] = 0; Gaussian partial integrals). For w = 50: z* ~ 1.50
+        w = COST_W_UNDERPREDICT
+        self.residential_shift = brentq(
+            lambda z: z * (norm.cdf(z) + w * (1.0 - norm.cdf(z))) - (w - 1.0) * norm.pdf(z),
+            0.0, 5.0,
+        )
+
+
     def fit_model(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray, train_residential_flags: np.ndarray):
         """
         Fit your model on the given training data.
@@ -44,29 +134,70 @@ class Model(object):
         :param train_pollution_targets: Training pollution concentrations as a 1d NumPy float array of shape (NUM_SAMPLES,)
         :param train_residential_flags: Binary variable denoting whether the 2D training point is in the residential area (1) or not (0)
         """
-        #because of the size of train_x, we proceed to undersampling with n_samples data
-        #we don't try to keep more data within the candidate area because we have weighted dataset (more than 7000 of data points are within candidate area => sea test_code.py)
-        # TODO: Fit your model here
-        n_samples = 5000
-        subset_idx = self.rng.choice(train_coordinates.shape[0],size = n_samples, replace=False)
-        X = train_coordinates[subset_idx]
-        Y = train_pollution_targets[subset_idx]
-        #we define the kernel by combining simple building blocks
-        kernel = (
-        ConstantKernel(1.0, (1e-3, 1e3))                  # signal variance to get a constant kernel that has the good order of magnitude. 1 is the starting point and (1e-3, 1e3) is the bound the optimizer is allowed to search within
-        * RBF(length_scale=0.2, length_scale_bounds=(1e-2, 1e2))  # spatial correlation => correlation is maximal at distance 0 and decays smoothly to 0 as points separate, at a rate controlled by length_scale
-        + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e2))  # measurement noise => we selected white noise to have zero covariance between the noises from different points. (because we assume that noises are independent between data points)
-    )
-        #we fit to maximize the marginal likelihood 
-        self.gp = GaussianProcessRegressor(
-        kernel=kernel,
-        n_restarts_optimizer=15,   # log-ML is non-convex so we could get stuck in local minima 
-        normalize_y=True,        # handles the mean function m(x) for us
-    )
-        self.gp.fit(X, Y)
-        pass
+        X = np.asarray(train_coordinates, dtype=float)
+        y = np.asarray(train_pollution_targets, dtype=float)
+        flags = np.asarray(train_residential_flags, dtype=bool)
 
-    # Don't change the name or the signature of this function
+        # --- Stage 1: learn hyperparameters (l, sigma_f, sigma_n) by maximizing the
+        # marginal likelihood on a cost-aware stratified subsample (sklearn GP) ---
+        length_scale, sigma_f, sigma_n = self._learn_hyperparameters(X, y, flags)
+
+        # --- Stage 2: cost-aware landmark placement (k-means; oversample residential areas,
+        # where underpredictions cost 50x more) ---
+        landmarks = self._select_landmarks(X, flags, self.N_LANDMARKS)
+
+        # --- Stage 3: Nyström GP fit on the FULL dataset ---
+        self.gp = NystroemGP(length_scale=length_scale, sigma_f=sigma_f, sigma_n=sigma_n)
+        self.gp.fit(X, y, landmarks)
+
+        print(f"[fit_model] l = {length_scale:.4f}, sigma_f = {sigma_f:.4f}, "
+              f"sigma_n = {sigma_n:.4f}, landmarks = {landmarks.shape[0]}")
+
+    def _learn_hyperparameters(self, X: np.ndarray, y: np.ndarray, flags: np.ndarray) -> Tuple[float, float, float]:
+        
+        
+        n = min(self.N_HYPER_SAMPLE, X.shape[0])
+        idx = self.rng.choice(X.shape[0], size=n, replace=False)
+        # Hypothesis: smooth spatial field (RBF) + white measurement noise
+        kernel = (
+            ConstantKernel(1.0, (1e-3, 1e3))
+            * RBF(length_scale=0.2, length_scale_bounds=(1e-2, 1e2))
+            + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-3, 1e2))
+        )
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, normalize_y=True)
+        gp.fit(X[idx], y[idx])
+
+        # Unpack learned hyperparameters from (Constant * RBF + White) structure
+        amp_kernel = gp.kernel_.k1.k1          # ConstantKernel -> sigma_f^2
+        rbf_kernel = gp.kernel_.k1.k2          # RBF            -> length_scale
+        white_kernel = gp.kernel_.k2          # WhiteKernel    -> sigma_n^2
+        sigma_f = float(np.sqrt(amp_kernel.constant_value))
+        length_scale = float(rbf_kernel.length_scale)
+        sigma_n = float(np.sqrt(white_kernel.noise_level))
+        y_scale = float(np.std(y[idx]))
+        sigma_f *= y_scale
+        sigma_n *= y_scale
+        return length_scale, sigma_f, sigma_n
+
+    def _select_landmarks(self, X: np.ndarray, flags: np.ndarray, n_landmarks: int) -> np.ndarray:
+        """
+        Cost-aware Nyström landmarks: k-means centers over the whole city,
+        plus a dedicated budget of centers inside residential areas.
+        """
+        n_res_budget = int(round(self.RES_LANDMARK_FRACTION * n_landmarks))
+        X_res = X[flags]
+
+        centers = []
+        n_res = min(n_res_budget, X_res.shape[0])
+        if n_res > 0:
+            km_res = KMeans(n_clusters=n_res, n_init=10, random_state=0).fit(X_res)
+            centers.append(km_res.cluster_centers_)
+        n_glob = n_landmarks - n_res
+        if n_glob > 0:
+            km_glob = KMeans(n_clusters=n_glob, n_init=10, random_state=0).fit(X)
+            centers.append(km_glob.cluster_centers_)
+        return np.vstack(centers)
+
     def predict_pollution(self, test_coordinates: np.ndarray, test_residential_flags: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict the pollution concentration for a given set of city_areas.
@@ -76,18 +207,19 @@ class Model(object):
             Tuple of three 1d NumPy float arrays, each of shape (NUM_SAMPLES,),
             containing your predictions, the GP posterior mean, and the GP posterior stddev (in that order)
         """
-
-        # TODO: Use your GP to estimate the posterior mean and stddev for each city_area here
-        gp_mean = np.zeros(test_coordinates.shape[0], dtype=float)
-        gp_std = np.zeros(test_coordinates.shape[0], dtype=float)
-        gp_mean,gp_std = self.gp.predict(test_coordinates,return_std=True)
+        # Belief: posterior mean and (noise-free) posterior std at every test point
+        gp_mean, gp_std = self.gp.predict(np.asarray(test_coordinates, dtype=float))
         gp_std = gp_std.ravel()
-        # TODO: Use the GP posterior to form your predictions here
+
+        # Decision rule: symmetric-loss optimum (mean) everywhere, except in
+        # residential areas, where underprediction costs 50x more -> report the
+        # Bayes-optimal shifted value mu + z* sigma (z* ~ 1.5 for w = 50).
         predictions = gp_mean.copy()
-        # In residential area only we predict a bit higher than our best guess using a optimal standard deviation (computed at line 34)
         res = np.asarray(test_residential_flags, dtype=bool)
         predictions[res] += self.residential_shift * gp_std[res]
+
         return predictions, gp_mean, gp_std
+
 
 # You don't have to change this function
 def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, residential_flags: np.ndarray) -> float:
@@ -123,6 +255,7 @@ def is_inside_circle(coordinate, circle_parameters):
     """
     return (coordinate[0] - circle_parameters[0])**2 + (coordinate[1] - circle_parameters[1])**2 < circle_parameters[2]**2
 
+
 # You don't have to change this function
 def determine_residential_flags(grid_coordinates):
     """
@@ -153,6 +286,7 @@ def determine_residential_flags(grid_coordinates):
         residential_flags[i] = any([is_inside_circle(coordinate, circ) for circ in circles])
 
     return residential_flags
+
 
 # Don't change the name or the signature of this function
 def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'):
@@ -191,7 +325,8 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
 
     plt.show()
 
-# You do not need to change the name or the signature of this function; convenience helper used by main() 
+
+# Don't change the name or the signature of this function
 def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extracts the city_area information from the training and test features.
@@ -200,22 +335,17 @@ def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[
     :return: Tuple of (training features' 2D coordinates, training features' city_area information,
         test features' 2D coordinates, test features' city_area information)
     """
-    train_coordinates = np.zeros((train_x.shape[0], 2), dtype=float)
-    train_residential_flags = np.zeros((train_x.shape[0],), dtype=bool)
-    test_coordinates = np.zeros((test_x.shape[0], 2), dtype=float)
-    test_residential_flags = np.zeros((test_x.shape[0],), dtype=bool)
-
-    #TODO: Extract the city_area information from the training and test features
-    train_coordinates = train_x[:,:2]
-    train_residential_flags = train_x[:,2] > 0
-    test_coordinates = test_x[:,:2]
-    test_residential_flags = test_x[:,2] > 0
+    train_coordinates = train_x[:, :2]
+    train_residential_flags = train_x[:, 2] > 0
+    test_coordinates = test_x[:, :2]
+    test_residential_flags = test_x[:, 2] > 0
 
     assert train_coordinates.shape[0] == train_residential_flags.shape[0] and test_coordinates.shape[0] == test_residential_flags.shape[0]
     assert train_coordinates.shape[1] == 2 and test_coordinates.shape[1] == 2
     assert train_residential_flags.ndim == 1 and test_residential_flags.ndim == 1
 
     return train_coordinates, train_residential_flags, test_coordinates, test_residential_flags
+
 
 # you don't have to change this function
 def main():
