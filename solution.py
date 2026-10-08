@@ -29,6 +29,7 @@ class Model(object):
         Initialize your model here.
         We already provide a random number generator for reproducibility.
         """
+        #We solve the optimization problem to find the right multiplier z to get the proper scaling of the original GP best guess.
         self.rng = np.random.default_rng(seed=0)
         z = brentq(lambda z: z * (norm.cdf(z) + 50 * (1 - norm.cdf(z))) - 49 * norm.pdf(z), 0, 5)
         self.residential_shift = z
@@ -46,7 +47,7 @@ class Model(object):
         #because of the size of train_x, we proceed to undersampling with n_samples data
         #we don't try to keep more data within the candidate area because we have weighted dataset (more than 7000 of data points are within candidate area => sea test_code.py)
         # TODO: Fit your model here
-        n_samples = 2000
+        n_samples = 5000
         subset_idx = self.rng.choice(train_coordinates.shape[0],size = n_samples, replace=False)
         X = train_coordinates[subset_idx]
         Y = train_pollution_targets[subset_idx]
@@ -83,6 +84,7 @@ class Model(object):
         gp_std = gp_std.ravel()
         # TODO: Use the GP posterior to form your predictions here
         predictions = gp_mean.copy()
+        # In residential area only we predict a bit higher than our best guess using a optimal standard deviation (computed at line 34)
         res = np.asarray(test_residential_flags, dtype=bool)
         predictions[res] += self.residential_shift * gp_std[res]
         return predictions, gp_mean, gp_std
