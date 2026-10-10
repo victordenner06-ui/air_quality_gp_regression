@@ -10,7 +10,7 @@ Given training coordinates with measured pollution levels, predict pollution at 
 
 `solution.py` implements a **Nyström low-rank Gaussian Process** in three parts:
 
-1. **Model selection** — hyperparameters of a composite kernel (RBF for the smooth large-scale trend + Matérn 5/2 for rough local structure + white noise) are chosen by maximizing the GP marginal likelihood with an exact sklearn GP on a 1000-point subsample.
+1. **Model selection** — hyperparameters of a composite kernel (RationalQuadratic for the smooth large-scale trend + Matérn 5/2 for rough local structure + white noise) are chosen by maximizing the GP marginal likelihood with an exact sklearn GP on a 1000-point subsample. The RationalQuadratic is a scale-mixture of RBFs: its `alpha` parameter lets a single component model variation at multiple length-scales.
 
 2. **Scalable fitting** — the full GP is approximated at rank *m* using inducing points from k-means over all training coordinates. With the explicit feature map `phi(x) = L_mm^-1 k(Z, x)`, the GP becomes exact Bayesian linear regression on *m* features, so training needs only an *m x m* Cholesky (O(n m²) instead of O(n³)) and all data is used. The number of inducing points *m* is adapted so their spacing stays below the learned Matérn lengthscale (minimum 5000).
 

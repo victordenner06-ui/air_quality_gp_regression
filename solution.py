@@ -20,10 +20,10 @@ class Model(object):
     Model for this task: a Nyström low-rank Gaussian Process.
 
     Strategy:
-      1. Model selection: a composite kernel (RBF for the smooth large-scale
-         trend + Matérn 5/2 for rougher local structure + white measurement
-         noise) has its hyperparameters chosen by maximizing the GP marginal
-         likelihood with an exact sklearn GP on a manageable subsample.
+      1. Model selection: a composite kernel (RationalQuadratic for the smooth
+         large-scale trend + Matérn 5/2 for rougher local structure + white
+         measurement noise) has its hyperparameters chosen by maximizing the GP
+         marginal likelihood with an exact sklearn GP on a subsample.
       2. Large-scale learning: the full model is a rank-m Nyström approximation
          of the GP. With inducing points Z (k-means over ALL training
          coordinates) the kernel is approximated as
@@ -65,8 +65,9 @@ class Model(object):
         self._y_std = 1.0
 
         # composite-kernel hyperparameters (set in fit_model via marginal likelihood)
-        self.rbf_len = 0.3   # RBF lengthscale: smooth, large-scale trend
-        self.rbf_var = 1.0   # RBF variance (amplitude squared)
+        self.rq_len = 0.3    # RationalQuadratic lengthscale: smooth, large-scale trend
+        self.rq_var = 1.0    # RationalQuadratic variance (amplitude squared)
+        self.rq_alpha = 1.0  # RationalQuadratic alpha: scale-mixture weight (alpha -> inf recovers the RBF)
         self.mat_len = 0.1   # Matérn 5/2 lengthscale: rough local structure
         self.mat_var = 0.5   # Matérn 5/2 variance (amplitude squared)
         self.noise_std = 0.1 # measurement noise std
@@ -104,8 +105,9 @@ class Model(object):
         self._select_hyperparameters(X, y)
         # hyperparameter print (lengthscales converted back to map coordinates)
         scale = float(np.mean(self._x_std))
-        print(f"[model] kernel (map units): rbf_len={self.rbf_len * scale:.4f}, "
-              f"mat_len={self.mat_len * scale:.4f}, rbf_var={self.rbf_var:.3f}, "
+        print(f"[model] kernel (map units): rq_len={self.rq_len * scale:.4f}, "
+              f"rq_alpha={self.rq_alpha:.3f}, rq_var={self.rq_var:.3f}, "
+              f"mat_len={self.mat_len * scale:.4f}, "
               f"mat_var={self.mat_var:.3f}, noise_std={self.noise_std * self._y_std:.3f}")
 
         # ---- 2) inducing points from ALL training coordinates (k-means) ----
@@ -169,23 +171,26 @@ class Model(object):
     def _kernel_cross(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
         """
         Cross-kernel matrix k(X1, X2) with the current composite kernel:
-            k = rbf_var * RBF(rbf_len) + mat_var * Matern_{nu=2.5}(mat_len)
-        The RBF models the smooth large-scale trend of the pollution field,
-        the Matérn 5/2 the rougher local structure (a real PM2.5 field is only
-        once/twice mean-square differentiable, not infinitely smooth as the
-        RBF assumes). The Nyström machinery below is kernel-agnostic: any
-        kernel that can be evaluated as a cross-covariance works unchanged.
+            k = rq_var * RQ(rq_len, rq_alpha) + mat_var * Matern_{nu=2.5}(mat_len)
+        The RationalQuadratic models the smooth large-scale trend of the
+        pollution field (a scale-mixture of RBFs: small alpha mixes several
+        lengthscales, alpha -> inf recovers the RBF), the Matérn 5/2 the
+        rougher local structure (a real PM2.5 field is only once/twice
+        mean-square differentiable). The Nyström machinery below is
+        kernel-agnostic: any kernel that can be evaluated as a
+        cross-covariance works unchanged.
         """
         d2 = self._sq_dists(X1, X2)
-        rbf = self.rbf_var * np.exp(-0.5 * d2 / (self.rbf_len ** 2))
+        # RationalQuadratic: (1 + d^2 / (2 * alpha * l^2))^-alpha
+        rq = self.rq_var * (1.0 + d2 / (2.0 * self.rq_alpha * self.rq_len ** 2)) ** (-self.rq_alpha)
         # Matérn with nu = 2.5:  (1 + s + s^2/3) * exp(-s),  s = sqrt(5) d / l
         s = np.sqrt(5.0) * np.sqrt(d2) / self.mat_len
         matern = self.mat_var * (1.0 + s + s ** 2 / 3.0) * np.exp(-s)
-        return rbf + matern
+        return rq + matern
 
     def _prior_variance(self) -> float:
         """Prior variance k(x, x) of the composite kernel (sum of amplitudes)."""
-        return self.rbf_var + self.mat_var
+        return self.rq_var + self.mat_var
 
     def _features(self, Xc: np.ndarray) -> np.ndarray:
         """
@@ -208,7 +213,9 @@ class Model(object):
 
         kernel = (
             ConstantKernel(1.0, constant_value_bounds=(1e-2, 1e3))
-            * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 1e1))
+            * RationalQuadratic(length_scale=0.3, alpha=1.0,
+                                length_scale_bounds=(1e-2, 1e1),
+                                alpha_bounds=(1e-2, 1e3))
             + ConstantKernel(0.5, constant_value_bounds=(1e-2, 1e3))
             * Matern(length_scale=0.1, nu=2.5, length_scale_bounds=(1e-2, 1e1))
             + WhiteKernel(noise_level=0.05, noise_level_bounds=(1e-5, 1e1))
@@ -224,21 +231,23 @@ class Model(object):
         try:
             out = {}
             self._collect_kernel_params(gp.kernel_, out)
-            self.rbf_var = out["rbf_var"]
-            self.rbf_len = out["rbf_len"]
+            self.rq_var = out["rq_var"]
+            self.rq_len = out["rq_len"]
+            self.rq_alpha = out["rq_alpha"]
             self.mat_var = out["mat_var"]
             self.mat_len = out["mat_len"]
             self.noise_std = float(np.sqrt(out["noise"]))
         except (KeyError, AttributeError, TypeError):
             # robust fallback: data-driven defaults
             var = float(np.var(y))
-            self.rbf_var, self.rbf_len = 0.7 * var, 0.3
+            self.rq_var, self.rq_len, self.rq_alpha = 0.7 * var, 0.3, 1.0
             self.mat_var, self.mat_len = 0.3 * var, 0.1
             self.noise_std = 0.1 * float(np.sqrt(var))
         # guard against degenerate values
-        self.rbf_var = max(float(self.rbf_var), 1e-6)
+        self.rq_var = max(float(self.rq_var), 1e-6)
         self.mat_var = max(float(self.mat_var), 1e-6)
-        self.rbf_len = max(float(self.rbf_len), 1e-3)
+        self.rq_len = max(float(self.rq_len), 1e-3)
+        self.rq_alpha = max(float(self.rq_alpha), 1e-3)
         self.mat_len = max(float(self.mat_len), 1e-3)
         self.noise_std = max(self.noise_std, 1e-4)
 
@@ -261,8 +270,9 @@ class Model(object):
                 else:
                     base = child
             ls = float(np.atleast_1d(base.length_scale).mean())
-            if isinstance(base, RBF):
-                out["rbf_var"], out["rbf_len"] = amp, ls
+            if isinstance(base, RationalQuadratic):
+                out["rq_var"], out["rq_len"] = amp, ls
+                out["rq_alpha"] = float(np.atleast_1d(base.alpha).mean())
             elif isinstance(base, Matern):
                 out["mat_var"], out["mat_len"] = amp, ls
         elif isinstance(node, WhiteKernel):
