@@ -5,24 +5,21 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.cluster import KMeans
 from scipy.linalg import cho_solve, solve_triangular
+from scipy.optimize import brentq
+from scipy.stats import norm
 import matplotlib.pyplot as plt
 from matplotlib import cm
 
-
-# Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
 EXTENDED_EVALUATION = False
 EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluation
-
 # Cost function constants
 COST_W_UNDERPREDICT = 50.0
 COST_W_NORMAL = 1.0
-
-
 class Model(object):
     """
     Model for this task: a Nyström low-rank Gaussian Process.
 
-    Strategy (see TASK1 challenges):
+    Strategy:
       1. Model selection: a composite kernel (RBF for the smooth large-scale
          trend + Matérn 5/2 for rougher local structure + white measurement
          noise) has its hyperparameters chosen by maximizing the GP marginal
@@ -43,22 +40,21 @@ class Model(object):
          Gaussian posterior the Bayes-optimal point prediction under this
          weighted squared loss is mean + z*std, where z* solves
              z*(W - (W-1) * Phi(z)) = (W-1) * phi(z)   with W = 50,
-         i.e. z* ~= 1.49. z is tuned on a held-out split with the actual
-         weighted cost function to guard against variance miscalibration.
+         i.e. z* ~= 1.4852, computed exactly at init with a root finder.
+         Empirical tuning on a noisy holdout is deliberately not used:
+         validation targets contain measurement noise while the test targets
+         do not, so naive holdout tuning would inflate z by
+         ~ sqrt(1 + sigma_n^2 / sigma_latent^2).
     """
-
-    # ------------------- configuration -------------------
-    M_INDUCING = 4000          # number m of Nyström inducing points
-    HPARAM_SUBSAMPLE = 2500   # subsample size for hyperparameter selection
-    HPARAM_RESTARTS = 2       # L-BFGS restarts for the marginal likelihood
-    TUNE_Z = True             # tune the asymmetric-cost shift on a holdout?
-    Z_GRID = np.linspace(0.0, 3.0, 61)  # candidate shifts, in posterior stds
+#config of the size of inducing points and the parameters train point
+    M_INDUCING = 5000          # minimum number m of Nyström inducing points
+    HPARAM_SUBSAMPLE = 1000    # subsample size for hyperparameter selection
+    HPARAM_RESTARTS = 0       # L-BFGS restarts for the marginal likelihood
     CHUNK = 2000              # chunk size to keep memory bounded
 
     def __init__(self):
         """
-        Initialize your model here.
-        We already provide a random number generator for reproducibility.
+        We initialize our model here.
         """
         self.rng = np.random.default_rng(seed=0)
 
@@ -82,21 +78,18 @@ class Model(object):
         self._w_mean = None     # posterior mean of the feature weights w
 
         # asymmetric-cost decision rule: predict mean + z_shift * posterior std
-        # in residential areas (z ~= 1.49 is Bayes-optimal for weight 50)
-        self.z_shift = 1.49
+        # in residential areas. Exact Bayes optimum for the weighted squared
+        # loss (see _optimal_shift), computed instead of hardcoded.
+        self.z_shift = self._optimal_shift(COST_W_UNDERPREDICT)
 
-    # =================================================================
-    # Public API
-    # =================================================================
-
-    # Don't change the name or the signature of this function
     def fit_model(self, train_coordinates: np.ndarray, train_pollution_targets: np.ndarray, train_residential_flags: np.ndarray):
         """
         Fit the Nyström GP on the given training data.
         """
         X_raw = np.asarray(train_coordinates, dtype=float)
         y_raw = np.asarray(train_pollution_targets, dtype=float).ravel()
-        flags = np.asarray(train_residential_flags).astype(bool).ravel()
+        # train_residential_flags is not needed for fitting: the asymmetric
+        # cost only matters at prediction time (via the test-side flags).
         n = X_raw.shape[0]
 
         # ---- 0) standardize inputs and targets ----
@@ -109,19 +102,27 @@ class Model(object):
 
         # ---- 1) kernel & hyperparameter selection via marginal likelihood ----
         self._select_hyperparameters(X, y)
+        # hyperparameter print (lengthscales converted back to map coordinates)
+        scale = float(np.mean(self._x_std))
+        print(f"[model] kernel (map units): rbf_len={self.rbf_len * scale:.4f}, "
+              f"mat_len={self.mat_len * scale:.4f}, rbf_var={self.rbf_var:.3f}, "
+              f"mat_var={self.mat_var:.3f}, noise_std={self.noise_std * self._y_std:.3f}")
 
         # ---- 2) inducing points from ALL training coordinates (k-means) ----
-        m = min(self.M_INDUCING, n)
+        # Adaptive m (uncapped): the average inducing spacing (~1/sqrt(m) on
+        # the unit map) must stay below the learned Matérn lengthscale,
+        # otherwise the rank-m approximation smooths over the fine local
+        # structure it should capture. Beware: memory grows quadratically -
+        # each m x m matrix (A, K_mm, L_mm, L_lam) costs 8*m^2 bytes.
+        mat_len_map = self.mat_len * scale
+        m_needed = int(np.ceil((1.2 / max(mat_len_map, 1e-4)) ** 2))
+        m = min(max(m_needed, self.M_INDUCING), n)
+        print(f"[model] inducing points: m = {m} "
+              f"(mat_len_map={mat_len_map:.4f}, spacing~{1.0 / np.sqrt(max(m, 1)):.4f}, "
+              f"~{8 * m * m / 1e6:.0f} MB per m x m matrix)")
         Z = self._select_inducing_points(X, m)
-
-        # ---- 3) tune the asymmetric-cost shift z on a held-out split ----
-        if self.TUNE_Z and n > 5000:
-            self.z_shift = self._tune_z(X, y, flags, Z)
-
-        # ---- 4) final Nyström fit on the full dataset ----
         self._fit_nystrom(X, y, Z)
 
-    # Don't change the name or the signature of this function
     def predict_pollution(self, test_coordinates: np.ndarray, test_residential_flags: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict the pollution concentration for a given set of city_areas.
@@ -135,13 +136,9 @@ class Model(object):
         for i in range(0, n_test, self.CHUNK):
             Phi = self._features(Xs[i:i + self.CHUNK])          # (chunk, m)
             # posterior mean of the latent function
+            Phi = self._features(Xs[i:i + self.CHUNK])
             gp_mean[i:i + self.CHUNK] = Phi @ self._w_mean
-            # posterior variance: diag(Phi @ Lambda^{-1} @ Phi^T)
-            T = cho_solve((self._L_lam, True), Phi.T)           # (m, chunk)
-            var = np.einsum("ij,ji->i", Phi, T)
-            # DTC-style correction: add the prior variance that the rank-m
-            # feature map does not capture (SoR would otherwise underestimate
-            # the variance away from the inducing points).
+            var = np.einsum("ij,ij->i", Phi @ self._Sigma, Phi)      
             var += np.maximum(self._prior_variance() - np.sum(Phi ** 2, axis=1), 0.0)
             gp_var[i:i + self.CHUNK] = np.maximum(var, 0.0)
 
@@ -159,10 +156,7 @@ class Model(object):
         predictions[residential] += self.z_shift * gp_std[residential]
 
         return predictions, gp_mean, gp_std
-
-    # =================================================================
-    # Internal helpers
-    # =================================================================
+#part for the nystrom solution:
 
     def _sq_dists(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
         """Pairwise squared euclidean distances between rows of A and B."""
@@ -204,8 +198,7 @@ class Model(object):
 
     def _select_hyperparameters(self, X: np.ndarray, y: np.ndarray) -> None:
         """
-        Challenge 1 - model selection.
-        Maximize the GP marginal likelihood with an exact sklearn GP on a
+        We maximize the GP marginal likelihood with an exact sklearn GP on a
         subsample (cheap enough at O(s^3)), then reuse the optimized kernel
         hyperparameters in the scalable full-data Nyström model.
         """
@@ -296,8 +289,7 @@ class Model(object):
 
     def _fit_nystrom(self, X: np.ndarray, y: np.ndarray, Z: np.ndarray) -> None:
         """
-        Challenge 2 - large-scale learning.
-        Fit the rank-m Nyström GP via Bayesian linear regression on the
+         We fit the rank-m Nyström GP via Bayesian linear regression on the
         feature map phi(x):  f(x) = phi(x)^T w,  w ~ N(0, I_m).
 
         Posterior over the weights:
@@ -326,38 +318,28 @@ class Model(object):
         # posterior precision of w and its Cholesky factor
         Lam = A / (self.noise_std ** 2) + np.eye(m)
         self._L_lam = np.linalg.cholesky(Lam)
+        self._Sigma = cho_solve((self._L_lam, True), np.eye(m))
         self._w_mean = cho_solve((self._L_lam, True), b / (self.noise_std ** 2))
 
-    def _tune_z(self, X: np.ndarray, y: np.ndarray, flags: np.ndarray, Z: np.ndarray) -> float:
+    @staticmethod
+    def _optimal_shift(weight: float) -> float:
         """
-        Challenge 3 - asymmetric cost.
-        Empirically tune the residential-area shift z on a held-out split by
-        minimizing the actual weighted cost (guards against miscalibrated
-        posterior variance). The analytic optimum for a Gaussian posterior is
-        z* ~= 1.49; the empirical optimum should land near it.
+        Exact Bayes-optimal shift under the weighted squared loss
+            (f - a)^2 * (1 + (W-1) * 1{f > a}),  a = mu + z * sigma,
+        for a Gaussian posterior: minimize E[(z - t)^2 (1 + (W-1) 1{t > z})]
+        with t ~ N(0, 1), whose first-order condition is
+            z * (Phi(z) + W * (1 - Phi(z))) = (W - 1) * phi(z).
+        For W = 50 the root is z* ~= 1.4852.
         """
-        n = X.shape[0]
-        n_val = min(max(500, n // 10), n - 1)
-        perm = self.rng.permutation(n)
-        val, fit_idx = perm[:n_val], perm[n_val:]
+        try:
+            return float(brentq(
+                lambda z: z * (norm.cdf(z) + weight * (1.0 - norm.cdf(z)))
+                          - (weight - 1.0) * norm.pdf(z),
+                0.0, 5.0, xtol=1e-10,
+            ))
+        except Exception:
+            return 1.4852  # analytic value for W = 50
 
-        # temporary fit on the training part only
-        self._fit_nystrom(X[fit_idx], y[fit_idx], Z)
-
-        # evaluate on the held-out part (raw units, as the checker does)
-        X_val_raw = X[val] * self._x_std + self._x_mean
-        y_val_raw = y[val] * self._y_std + self._y_mean
-        _, mean_val, std_val = self.predict_pollution(X_val_raw, flags[val])
-
-        costs = []
-        for z in self.Z_GRID:
-            preds = mean_val.copy()
-            res = flags[val]
-            preds[res] += z * std_val[res]
-            costs.append(calculate_cost(y_val_raw, preds, flags[val]))
-        return float(self.Z_GRID[int(np.argmin(costs))])
-
-# You don't have to change this function
 def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, residential_flags: np.ndarray) -> float:
     """
     Calculates the cost of a set of predictions.
@@ -380,8 +362,6 @@ def calculate_cost(ground_truth: np.ndarray, predictions: np.ndarray, residentia
     # Weigh the cost and return the average
     return np.mean(cost * weights)
 
-
-# You don't have to change this function
 def is_inside_circle(coordinate, circle_parameters):
     """
     Checks if a coordinate is inside a circle.
@@ -391,7 +371,6 @@ def is_inside_circle(coordinate, circle_parameters):
     """
     return (coordinate[0] - circle_parameters[0])**2 + (coordinate[1] - circle_parameters[1])**2 < circle_parameters[2]**2
 
-# You don't have to change this function
 def determine_residential_flags(grid_coordinates):
     """
     Determines the city_area index for each coordinate in the visualization grid.
@@ -422,7 +401,6 @@ def determine_residential_flags(grid_coordinates):
 
     return residential_flags
 
-# Don't change the name or the signature of this function
 def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'):
     """
     Visualizes the predictions of a fitted model.
@@ -459,7 +437,6 @@ def perform_extended_model_evaluation(model: Model, output_dir: str = '/results'
 
     plt.show()
 
-# You do not need to change the name or the signature of this function; convenience helper used by main()
 def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extracts the city_area information from the training and test features.
@@ -472,18 +449,10 @@ def get_city_area_data(train_x: np.ndarray, test_x: np.ndarray) -> typing.Tuple[
     test_x = np.asarray(test_x, dtype=float)
 
     # columns: lon, lat, area_id (binary residential-area flag)
-    train_coordinates = np.asarray(train_x[:, :2], dtype=float)
-    test_coordinates = np.asarray(test_x[:, :2], dtype=float)
-
-    if train_x.shape[1] > 2:
-        train_residential_flags = (train_x[:, 2] > 0.5).astype(bool)
-    else:
-        train_residential_flags = np.zeros(train_x.shape[0], dtype=bool)
-    if test_x.shape[1] > 2:
-        test_residential_flags = (test_x[:, 2] > 0.5).astype(bool)
-    else:
-        test_residential_flags = np.zeros(test_x.shape[0], dtype=bool)
-
+    train_coordinates = train_x[:,:2]
+    train_residential_flags = train_x[:,2] > 0
+    test_coordinates = test_x[:,:2]
+    test_residential_flags = test_x[:,2] > 0
     assert train_coordinates.shape[0] == train_residential_flags.shape[0] and test_coordinates.shape[0] == test_residential_flags.shape[0]
     assert train_coordinates.shape[1] == 2 and test_coordinates.shape[1] == 2
     assert train_residential_flags.ndim == 1 and test_residential_flags.ndim == 1

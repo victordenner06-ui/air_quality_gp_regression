@@ -10,7 +10,7 @@ from scipy.stats import norm
 import matplotlib.pyplot as plt
 from matplotlib import cm
 
-EXTENDED_EVALUATION = True
+EXTENDED_EVALUATION = False
 EVALUATION_GRID_POINTS = 300  # Number of grid points used in extended evaluation
 # Cost function constants
 COST_W_UNDERPREDICT = 50.0
@@ -47,9 +47,9 @@ class Model(object):
          ~ sqrt(1 + sigma_n^2 / sigma_latent^2).
     """
 #config of the size of inducing points and the parameters train point
-    M_INDUCING = 4000          # minimum number m of Nyström inducing points
-    HPARAM_SUBSAMPLE = 3000    # subsample size for hyperparameter selection
-    HPARAM_RESTARTS = 1        # L-BFGS restarts for the marginal likelihood
+    M_INDUCING = 5000          # minimum number m of Nyström inducing points
+    HPARAM_SUBSAMPLE = 1000    # subsample size for hyperparameter selection
+    HPARAM_RESTARTS = 0       # L-BFGS restarts for the marginal likelihood
     CHUNK = 2000              # chunk size to keep memory bounded
 
     def __init__(self):
@@ -136,13 +136,9 @@ class Model(object):
         for i in range(0, n_test, self.CHUNK):
             Phi = self._features(Xs[i:i + self.CHUNK])          # (chunk, m)
             # posterior mean of the latent function
+            Phi = self._features(Xs[i:i + self.CHUNK])
             gp_mean[i:i + self.CHUNK] = Phi @ self._w_mean
-            # posterior variance: diag(Phi @ Lambda^{-1} @ Phi^T)
-            T = cho_solve((self._L_lam, True), Phi.T)           # (m, chunk)
-            var = np.einsum("ij,ji->i", Phi, T)
-            # DTC-style correction: add the prior variance that the rank-m
-            # feature map does not capture (SoR would otherwise underestimate
-            # the variance away from the inducing points).
+            var = np.einsum("ij,ij->i", Phi @ self._Sigma, Phi)      
             var += np.maximum(self._prior_variance() - np.sum(Phi ** 2, axis=1), 0.0)
             gp_var[i:i + self.CHUNK] = np.maximum(var, 0.0)
 
@@ -322,6 +318,7 @@ class Model(object):
         # posterior precision of w and its Cholesky factor
         Lam = A / (self.noise_std ** 2) + np.eye(m)
         self._L_lam = np.linalg.cholesky(Lam)
+        self._Sigma = cho_solve((self._L_lam, True), np.eye(m))
         self._w_mean = cho_solve((self._L_lam, True), b / (self.noise_std ** 2))
 
     @staticmethod
