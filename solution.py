@@ -47,9 +47,9 @@ class Model(object):
          ~ sqrt(1 + sigma_n^2 / sigma_latent^2).
     """
 #config of the size of inducing points and the parameters train point
-    M_INDUCING = 5000          # minimum number m of Nyström inducing points
+    M_INDUCING = 5000          # number m of Nyström inducing points
     HPARAM_SUBSAMPLE = 1000    # subsample size for hyperparameter selection
-    HPARAM_RESTARTS = 0       # L-BFGS restarts for the marginal likelihood
+    HPARAM_RESTARTS = 0    # L-BFGS restarts for the marginal likelihood
     CHUNK = 2000              # chunk size to keep memory bounded
 
     def __init__(self):
@@ -109,19 +109,7 @@ class Model(object):
               f"rq_alpha={self.rq_alpha:.3f}, rq_var={self.rq_var:.3f}, "
               f"mat_len={self.mat_len * scale:.4f}, "
               f"mat_var={self.mat_var:.3f}, noise_std={self.noise_std * self._y_std:.3f}")
-
-        # ---- 2) inducing points from ALL training coordinates (k-means) ----
-        # Adaptive m (uncapped): the average inducing spacing (~1/sqrt(m) on
-        # the unit map) must stay below the learned Matérn lengthscale,
-        # otherwise the rank-m approximation smooths over the fine local
-        # structure it should capture. Beware: memory grows quadratically -
-        # each m x m matrix (A, K_mm, L_mm, L_lam) costs 8*m^2 bytes.
-        mat_len_map = self.mat_len * scale
-        m_needed = int(np.ceil((1.2 / max(mat_len_map, 1e-4)) ** 2))
-        m = min(max(m_needed, self.M_INDUCING), n)
-        print(f"[model] inducing points: m = {m} "
-              f"(mat_len_map={mat_len_map:.4f}, spacing~{1.0 / np.sqrt(max(m, 1)):.4f}, "
-              f"~{8 * m * m / 1e6:.0f} MB per m x m matrix)")
+        m = self.M_INDUCING
         Z = self._select_inducing_points(X, m)
         self._fit_nystrom(X, y, Z)
 
@@ -137,8 +125,6 @@ class Model(object):
 
         for i in range(0, n_test, self.CHUNK):
             Phi = self._features(Xs[i:i + self.CHUNK])          # (chunk, m)
-            # posterior mean of the latent function
-            Phi = self._features(Xs[i:i + self.CHUNK])
             gp_mean[i:i + self.CHUNK] = Phi @ self._w_mean
             var = np.einsum("ij,ij->i", Phi @ self._Sigma, Phi)      
             var += np.maximum(self._prior_variance() - np.sum(Phi ** 2, axis=1), 0.0)
@@ -156,7 +142,8 @@ class Model(object):
         predictions = gp_mean.copy()
         residential = np.asarray(test_residential_flags).astype(bool).ravel()
         predictions[residential] += self.z_shift * gp_std[residential]
-
+        #the PM2.5 can't be negeative
+        predictions = np.maximum(predictions, 0.0)
         return predictions, gp_mean, gp_std
 #part for the nystrom solution:
 
