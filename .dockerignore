@@ -1,0 +1,11 @@
+# Only the handout files and solution.py are needed by the checker.
+.git
+.gitignore
+experiments/
+submissions/
+scripts/
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+docs/
